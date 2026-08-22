@@ -1,0 +1,717 @@
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { Users, RefreshCw } from "lucide-react";
+
+const YEAR = 2026;
+const MONTH_INDEX = 8; // Septembrie (0-indexat)
+const DAYS_IN_MONTH = new Date(YEAR, MONTH_INDEX + 1, 0).getDate();
+const FIRST_WEEKDAY_MON = (new Date(YEAR, MONTH_INDEX, 1).getDay() + 6) % 7;
+const WEEKDAY_SHORT = ["LUN", "MAR", "MIE", "JOI", "VIN", "SÂM", "DUM"];
+const WEEKDAY_FULL = ["luni", "marți", "miercuri", "joi", "vineri", "sâmbătă", "duminică"];
+
+const CALENDAR_CELLS = [
+  ...Array.from({ length: FIRST_WEEKDAY_MON }, () => null),
+  ...Array.from({ length: DAYS_IN_MONTH }, (_, i) => i + 1),
+];
+
+const STATUS_CYCLE = [undefined, "liber", "ocupat"];
+
+function nextStatus(current) {
+  const idx = STATUS_CYCLE.indexOf(current);
+  return STATUS_CYCLE[(idx + 1) % STATUS_CYCLE.length];
+}
+
+function sanitizeKey(str) {
+  const base = (str || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return base || "utilizator-" + Math.random().toString(36).slice(2, 8);
+}
+
+function isToday(day) {
+  const now = new Date();
+  return (
+    now.getFullYear() === YEAR &&
+    now.getMonth() === MONTH_INDEX &&
+    now.getDate() === day
+  );
+}
+
+function formatTime(date) {
+  return date.toLocaleTimeString("ro-RO", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+export default function App() {
+  const [nameInput, setNameInput] = useState("");
+  const [myName, setMyName] = useState(null);
+  const [myVotes, setMyVotes] = useState({});
+  const [allEntries, setAllEntries] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
+  const [saveError, setSaveError] = useState(null);
+  const [selectedDay, setSelectedDay] = useState(null);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [justCleared, setJustCleared] = useState(false);
+  const clearedTimeoutRef = useRef(null);
+
+  // Preîncarcă ultimul nume folosit pe acest dispozitiv (confort, nu identitate)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await window.storage.get("display-name", false);
+        if (!cancelled && res && res.value) {
+          setNameInput(res.value);
+        }
+      } catch (e) {
+        // niciun nume salvat încă — normal la prima vizită
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const loadAllEntries = useCallback(async () => {
+    setLoadError(null);
+    try {
+      const listRes = await window.storage.list("votes:", true);
+      const keys = (listRes && listRes.keys) || [];
+      const results = {};
+      for (const key of keys) {
+        try {
+          const r = await window.storage.get(key, true);
+          if (r && r.value) {
+            results[key] = JSON.parse(r.value);
+          }
+        } catch (e) {
+          // o intrare coruptă nu trebuie să blocheze restul calendarului
+        }
+      }
+      setAllEntries(results);
+      setLastUpdated(new Date());
+    } catch (e) {
+      setLoadError("Nu am putut încărca datele. Verifică conexiunea.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadAllEntries();
+    const id = setInterval(loadAllEntries, 25000);
+    return () => clearInterval(id);
+  }, [loadAllEntries]);
+
+  useEffect(() => {
+    return () => {
+      if (clearedTimeoutRef.current) clearTimeout(clearedTimeoutRef.current);
+    };
+  }, []);
+
+  const confirmName = async () => {
+    const trimmed = nameInput.trim();
+    if (!trimmed) return;
+    setMyName(trimmed);
+    setSelectedDay(null);
+    try {
+      await window.storage.set("display-name", trimmed, false);
+    } catch (e) {
+      // e doar o comoditate locală, nu blocăm fluxul dacă eșuează
+    }
+    const key = `votes:${sanitizeKey(trimmed)}`;
+    try {
+      const r = await window.storage.get(key, true);
+      if (r && r.value) {
+        setMyVotes(JSON.parse(r.value).days || {});
+      } else {
+        setMyVotes({});
+      }
+    } catch (e) {
+      setMyVotes({});
+    }
+  };
+
+  const saveMyVotes = useCallback(async (updatedVotes, currentName) => {
+    const key = `votes:${sanitizeKey(currentName)}`;
+    try {
+      await window.storage.set(
+        key,
+        JSON.stringify({ name: currentName, days: updatedVotes }),
+        true
+      );
+      setSaveError(null);
+      setAllEntries((prev) => ({
+        ...prev,
+        [key]: { name: currentName, days: updatedVotes },
+      }));
+    } catch (e) {
+      setSaveError("Nu s-a putut salva votul. Verifică conexiunea și încearcă din nou.");
+    }
+  }, []);
+
+  const cycleVote = (day) => {
+    if (!myName) return;
+    const current = myVotes[day];
+    const next = nextStatus(current);
+    const updated = { ...myVotes };
+    if (next === undefined) {
+      delete updated[day];
+    } else {
+      updated[day] = next;
+    }
+    setMyVotes(updated);
+    setSelectedDay(day);
+    saveMyVotes(updated, myName);
+  };
+
+  const clearMyVotes = async () => {
+    if (!myName) return;
+    const key = `votes:${sanitizeKey(myName)}`;
+    try {
+      await window.storage.delete(key, true);
+    } catch (e) {
+      // dacă intrarea nu mai există deja, ștergerea eșuează silențios — e ok
+    }
+    setMyVotes({});
+    setAllEntries((prev) => {
+      const updated = { ...prev };
+      delete updated[key];
+      return updated;
+    });
+    setShowResetConfirm(false);
+    setJustCleared(true);
+    clearedTimeoutRef.current = setTimeout(() => setJustCleared(false), 3000);
+  };
+
+  const daySummaries = useMemo(() => {
+    const map = {};
+    for (let d = 1; d <= DAYS_IN_MONTH; d++) map[d] = { free: [], busy: [] };
+    Object.values(allEntries).forEach((entry) => {
+      if (!entry || !entry.days) return;
+      Object.entries(entry.days).forEach(([day, status]) => {
+        const d = Number(day);
+        if (!map[d]) return;
+        if (status === "liber") map[d].free.push(entry.name);
+        else if (status === "ocupat") map[d].busy.push(entry.name);
+      });
+    });
+    return map;
+  }, [allEntries]);
+
+  const participantCount = Object.keys(allEntries).length;
+
+  return (
+    <div className="app-root">
+      <style>{STYLES}</style>
+
+      <div className="container">
+        <header className="chrome-panel">
+          <div className="chrome-title">CALENDAR DISPONIBILITATE</div>
+          <div className="chrome-sub">Septembrie {YEAR}</div>
+          <div className="chrome-meta-row">
+            <span className="status-readout">
+              <Users size={13} strokeWidth={2.2} />
+              {participantCount} {participantCount === 1 ? "persoană" : "persoane"}
+            </span>
+            {myName && (
+              <span className="user-row">
+                {myName}
+                <button
+                  type="button"
+                  className="btn-link"
+                  onClick={() => {
+                    setMyName(null);
+                    setSelectedDay(null);
+                  }}
+                >
+                  schimbă
+                </button>
+              </span>
+            )}
+          </div>
+        </header>
+
+        {!myName ? (
+          <div className="gate-card">
+            <div className="gate-label">Cine votează?</div>
+            <input
+              className="input-name"
+              type="text"
+              value={nameInput}
+              onChange={(e) => setNameInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") confirmName();
+              }}
+              placeholder="Numele tău"
+              maxLength={40}
+              autoFocus
+            />
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={confirmName}
+              disabled={!nameInput.trim()}
+            >
+              Continuă
+            </button>
+            <p className="hint-text">
+              Numele și voturile tale vor fi vizibile tuturor celor care au acest link.
+              Dacă sunteți doi cu același nume, adaugă și inițiala numelui de familie.
+            </p>
+          </div>
+        ) : (
+          <>
+            <div className="legend-row">
+              <span className="legend-item">
+                <span className="status-dot status-dot--liber small-static">✓</span>
+                Liber
+              </span>
+              <span className="legend-item">
+                <span className="status-dot status-dot--ocupat small-static">✕</span>
+                Ocupat
+              </span>
+              <span className="legend-item">
+                <span className="status-dot small-static" />
+                Nevotat
+              </span>
+            </div>
+            <p className="tap-hint">Atinge o zi ca să votezi. Fiecare atingere schimbă starea.</p>
+
+            {loading ? (
+              <div className="calendar-card loading-state">Se încarcă calendarul…</div>
+            ) : (
+              <div className="calendar-card">
+                <div className="weekday-header">
+                  {WEEKDAY_SHORT.map((w) => (
+                    <div key={w} className="weekday-cell">
+                      {w}
+                    </div>
+                  ))}
+                </div>
+                <div className="calendar-grid">
+                  {CALENDAR_CELLS.map((day, idx) => {
+                    if (day === null) {
+                      return <div key={`empty-${idx}`} className="day-cell empty" />;
+                    }
+                    const status = myVotes[day];
+                    const summary = daySummaries[day];
+                    const totalVotes = summary.free.length + summary.busy.length;
+                    const weekdayName = WEEKDAY_FULL[(FIRST_WEEKDAY_MON + day - 1) % 7];
+                    return (
+                      <button
+                        type="button"
+                        key={day}
+                        className={
+                          "day-cell" +
+                          (status ? " day-cell--" + status : "") +
+                          (selectedDay === day ? " selected" : "") +
+                          (isToday(day) ? " today" : "")
+                        }
+                        onClick={() => cycleVote(day)}
+                        aria-label={
+                          `${day} septembrie, ${weekdayName}, ` +
+                          (status === "liber" ? "liber" : status === "ocupat" ? "ocupat" : "nevotat")
+                        }
+                      >
+                        <span className="day-number">{String(day).padStart(2, "0")}</span>
+                        <span className={"status-dot" + (status ? " status-dot--" + status : "")}>
+                          {status === "liber" ? "✓" : status === "ocupat" ? "✕" : ""}
+                        </span>
+                        {totalVotes > 0 && (
+                          <span className="tally-row">
+                            {summary.free.slice(0, 6).map((_, i) => (
+                              <span key={"f" + i} className="tally-dot tally-dot--liber" />
+                            ))}
+                            {summary.busy.slice(0, 6).map((_, i) => (
+                              <span key={"b" + i} className="tally-dot tally-dot--ocupat" />
+                            ))}
+                            {totalVotes > 6 && (
+                              <span className="tally-more">+{totalVotes - 6}</span>
+                            )}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {loadError && <div className="error-banner">{loadError}</div>}
+            {saveError && <div className="error-banner">{saveError}</div>}
+
+            <div className="detail-panel">
+              {selectedDay ? (
+                <>
+                  <div className="detail-heading">
+                    {selectedDay} SEPTEMBRIE ·{" "}
+                    {WEEKDAY_FULL[(FIRST_WEEKDAY_MON + selectedDay - 1) % 7].toUpperCase()}
+                  </div>
+                  <div className="detail-row">
+                    <strong>Liberi ({daySummaries[selectedDay].free.length}):</strong>{" "}
+                    {daySummaries[selectedDay].free.join(", ") || "—"}
+                  </div>
+                  <div className="detail-row">
+                    <strong>Ocupați ({daySummaries[selectedDay].busy.length}):</strong>{" "}
+                    {daySummaries[selectedDay].busy.join(", ") || "—"}
+                  </div>
+                </>
+              ) : (
+                <div className="detail-empty">
+                  Atinge o zi din calendar pentru a vedea cine e liber.
+                </div>
+              )}
+            </div>
+
+            <div className="footer-row">
+              <div className="footer-left">
+                {showResetConfirm ? (
+                  <span className="confirm-inline">
+                    Ștergi toate zilele bifate de tine?
+                    <button type="button" className="btn-danger-text" onClick={clearMyVotes}>
+                      Da, șterge
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-link"
+                      onClick={() => setShowResetConfirm(false)}
+                    >
+                      Anulează
+                    </button>
+                  </span>
+                ) : justCleared ? (
+                  <span className="cleared-msg">Votul tău a fost șters.</span>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    onClick={() => setShowResetConfirm(true)}
+                  >
+                    Șterge votul meu
+                  </button>
+                )}
+              </div>
+              <button
+                type="button"
+                className={"btn-ghost refresh-btn" + (loading ? " spinning" : "")}
+                onClick={loadAllEntries}
+              >
+                <RefreshCw size={12} strokeWidth={2.2} />
+                {lastUpdated ? `actualizat ${formatTime(lastUpdated)}` : "actualizează"}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const STYLES = `
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+  --bg: #12151c;
+  --bg-panel: #1b1f29;
+  --paper: #eef0ec;
+  --paper-2: #e3e5e0;
+  --ink: #1c1e22;
+  --ink-soft: #6b7078;
+  --chrome-text: #e7e9ee;
+  --chrome-text-soft: #9aa0ac;
+  --go: #2fbe7b;
+  --busy: #e6483b;
+  --off: #c7c9ce;
+  --line: #d3d5cf;
+  --radius-lg: 14px;
+  --radius-sm: 6px;
+}
+
+* { box-sizing: border-box; }
+
+.app-root {
+  min-height: 100vh;
+  background: var(--bg);
+  background-image: radial-gradient(circle at 10% 0%, #1a1f2b 0%, var(--bg) 55%);
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+  color: var(--chrome-text);
+  padding: 20px 14px 40px;
+  display: flex;
+  justify-content: center;
+}
+
+.container { width: 100%; max-width: 480px; }
+
+/* Chrome header */
+.chrome-panel {
+  background: var(--bg-panel);
+  border: 1px solid #2a2f3c;
+  border-radius: var(--radius-lg);
+  padding: 16px 18px;
+  margin-bottom: 14px;
+}
+.chrome-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+}
+.chrome-sub {
+  font-size: 20px;
+  font-weight: 700;
+  margin-top: 2px;
+  letter-spacing: -0.01em;
+}
+.chrome-meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #2a2f3c;
+  font-size: 12px;
+  color: var(--chrome-text-soft);
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.status-readout {
+  font-family: 'JetBrains Mono', monospace;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--go);
+}
+.user-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--chrome-text);
+  font-weight: 500;
+}
+.btn-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--chrome-text-soft);
+  text-decoration: underline;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.btn-link:hover { color: var(--chrome-text); }
+.btn-link:focus-visible { outline: 2px solid var(--go); outline-offset: 2px; }
+
+/* Name gate */
+.gate-card {
+  background: var(--paper);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  color: var(--ink);
+}
+.gate-label { font-weight: 600; font-size: 15px; margin-bottom: 10px; }
+.input-name {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  border: 1.5px solid var(--paper-2);
+  background: #fff;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 15px;
+  color: var(--ink);
+  margin-bottom: 10px;
+}
+.input-name:focus { outline: none; border-color: var(--go); }
+.btn-primary {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: var(--go);
+  color: #06251a;
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+.btn-primary:disabled { background: var(--off); color: #6b6f74; cursor: not-allowed; }
+.btn-primary:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.hint-text { font-size: 12px; color: var(--ink-soft); margin-top: 12px; line-height: 1.5; }
+
+/* Legend */
+.legend-row {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 0 4px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.tap-hint { font-size: 12px; color: var(--chrome-text-soft); padding: 0 4px; margin: 4px 0 14px; }
+
+/* Calendar card */
+.calendar-card { background: var(--paper); border-radius: var(--radius-lg); padding: 14px; color: var(--ink); }
+.loading-state { text-align: center; padding: 40px 10px; color: var(--ink-soft); font-size: 13px; }
+.weekday-header {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+  margin-bottom: 6px;
+}
+.weekday-cell {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-align: center;
+  color: var(--ink-soft);
+}
+.calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.day-cell {
+  aspect-ratio: 1 / 1.05;
+  min-height: 56px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 4px 2px;
+  cursor: pointer;
+  font-family: inherit;
+  position: relative;
+  transition: border-color 0.15s ease, transform 0.1s ease;
+}
+.day-cell:active { transform: scale(0.96); }
+.day-cell.empty { border: none; background: transparent; cursor: default; }
+.day-cell--liber { border-left: 3px solid var(--go); }
+.day-cell--ocupat { border-left: 3px solid var(--busy); }
+.day-cell.selected { border-color: var(--ink); border-width: 1.5px; }
+.day-cell.today .day-number { text-decoration: underline; text-underline-offset: 3px; }
+.day-cell:focus-visible { outline: 2px solid var(--go); outline-offset: 2px; }
+.day-number { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 600; color: var(--ink); }
+.status-dot {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1.5px solid var(--off);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1;
+  color: transparent;
+}
+.status-dot.small-static { width: 14px; height: 14px; }
+.status-dot--liber { background: var(--go); border-color: var(--go); color: #06251a; }
+.status-dot--ocupat { background: var(--busy); border-color: var(--busy); color: #ffece9; }
+.tally-row { display: flex; flex-wrap: wrap; gap: 2px; justify-content: center; max-width: 100%; }
+.tally-dot { width: 5px; height: 5px; border-radius: 50%; }
+.tally-dot--liber { background: var(--go); }
+.tally-dot--ocupat { background: var(--busy); }
+.tally-more { font-family: 'JetBrains Mono', monospace; font-size: 8px; color: var(--ink-soft); }
+
+/* Error banner */
+.error-banner {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: #2a1512;
+  border-left: 3px solid var(--busy);
+  color: #ffd9d3;
+  font-size: 12px;
+}
+
+/* Detail panel */
+.detail-panel {
+  background: var(--bg-panel);
+  border: 1px solid #2a2f3c;
+  border-radius: var(--radius-lg);
+  padding: 16px 18px;
+  margin-top: 12px;
+  min-height: 84px;
+}
+.detail-heading {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--go);
+  margin-bottom: 8px;
+}
+.detail-row { font-size: 13px; color: var(--chrome-text-soft); margin-top: 4px; line-height: 1.5; }
+.detail-row strong { color: var(--chrome-text); }
+.detail-empty { font-size: 13px; color: var(--chrome-text-soft); line-height: 1.5; }
+
+/* Footer */
+.footer-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 12px;
+  padding: 0 4px;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.footer-left { min-height: 20px; }
+.btn-ghost {
+  background: none;
+  border: none;
+  color: var(--chrome-text-soft);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 0;
+}
+.btn-ghost:hover { color: var(--chrome-text); }
+.btn-ghost:focus-visible { outline: 2px solid var(--go); outline-offset: 2px; }
+.refresh-btn.spinning svg { animation: spin 0.9s linear infinite; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.confirm-inline {
+  font-size: 12px;
+  color: var(--chrome-text-soft);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.btn-danger-text {
+  background: none;
+  border: none;
+  color: var(--busy);
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+.cleared-msg { font-size: 12px; color: var(--go); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+@media (max-width: 360px) {
+  .day-cell { min-height: 48px; }
+  .status-dot { width: 15px; height: 15px; }
+  .weekday-cell { font-size: 9px; }
+}
+`;
